@@ -8,15 +8,10 @@ def generate_launch_description():
             executable='tidy_bot',
             name='tidy_bot_node',
             output='screen',
-            parameters=[
-                {'use_sim_time': True},
-                {'linear_speed': 0.3},
-                {'angular_speed': 0.8},
-            ],
-            remappings=[
-                ('/cmd_vel', '/cmd_vel'),
-                ('/scan', '/scan'),
-                ('/camera/image_raw', '/camera/color/image_raw'),
-            ]
-        ),
+            parameters=[{
+                'use_sim_time': True,
+                'linear_speed': 0.3,
+                'angular_speed': 0.8,
+            }],
+        )
     ])

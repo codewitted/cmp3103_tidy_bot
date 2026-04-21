@@ -7,184 +7,193 @@ Author: Kevin Byamukama
 Date: April 2026
 
 This node implements a high-fidelity autonomous controller for the AgileX Limo robot.
-Designed to meet Level 3 complexity, it features collinear alignment for pushing 
-blue cubes onto red patches while maintaining global orientation and dynamic obstacle avoidance.
-
-Logic Strategy:
-1. EXPLORE: Navigate the arena to find targets.
-2. TARGET_ACQUISITION: Detect blue box and red patch.
-3. POSITIONING: Calculate and navigate to the vector behind the box relative to the patch.
-4. PUSHING: Execution phase toward the goal patch.
-5. RECOVERY: Safety behavior for collisions or mission completion.
+Optimized for the official Gazebo simulation.
 """
 
+import math
+import cv2
+import numpy as np
 import rclpy
+
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan, Image
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
-import cv2
-import numpy as np
-import math
+
 
 class TidyBotNode(Node):
     def __init__(self):
         super().__init__('tidy_bot_node')
-        
-        # --- Parameters ---
+
         self.declare_parameter('linear_speed', 0.25)
         self.declare_parameter('angular_speed', 0.6)
-        
-        # --- Publishers & Subscribers ---
+
+        self.linear_speed = self.get_parameter('linear_speed').value
+        self.angular_speed = self.get_parameter('angular_speed').value
+
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
-        self.image_sub = self.create_subscription(Image, '/camera/color/image_raw', self.image_cb, 10)
-        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
-        
-        # --- Utilities ---
+        self.create_subscription(LaserScan, '/scan', self.scan_cb, 10)
+        self.create_subscription(Image, '/camera/color/image_raw', self.image_cb, 10)
+        self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
+
         self.bridge = CvBridge()
-        
-        # --- State Machine ---
-        # States: IDLE, EXPLORING, ALIGNING, PUSHING, RETURNING, AVOIDING
+
         self.state = "EXPLORING"
         self.prev_state = "IDLE"
         self.last_state_time = self.get_clock().now()
-        
-        # --- Perception State ---
-        self.obstacles = [5.0] * 360 # Mock lidar array
+
         self.hazard_front = False
-        
         self.box_visible = False
         self.box_center = 0
         self.box_area = 0
-        
         self.patch_visible = False
         self.patch_center = 0
-        
         self.img_w = 640
+
         self.pose = {"x": 0.0, "y": 0.0, "theta": 0.0}
-        
-        # --- HSV Calibration (Level 2/3 Discrimination) ---
-        self.blue_hsv = (np.array([100, 150, 50]), np.array([140, 255, 255]))
-        self.red_hsv = (np.array([0, 150, 50]), np.array([10, 255, 255]))
-        
-        # --- Control Loop ---
+
+        # HSV Thresholds
+        self.blue_lower = np.array([100, 120, 50])
+        self.blue_upper = np.array([140, 255, 255])
+
+        # Red wraps around HSV 0/180
+        self.red1_lower = np.array([0, 120, 70])
+        self.red1_upper = np.array([10, 255, 255])
+        self.red2_lower = np.array([170, 120, 70])
+        self.red2_upper = np.array([180, 255, 255])
+
         self.create_timer(0.1, self.control_tick)
-        self.get_logger().info("LIMO MISSION CONTROL: SYSTEM ONLINE. LEVEL 3 LOGIC ENGAGED.")
+        self.get_logger().info("TidyBot node started. Ready for mission.")
 
     def scan_cb(self, msg):
-        """Processes LiDAR data for hazard detection."""
-        # Check front 40-degree cone (AgileX Limo LiDAR setup)
-        num = len(msg.ranges)
-        samples = msg.ranges[int(num*0.45):int(num*0.55)] # Adjust based on driver frame
+        """Processes LiDAR for hazard detection in the front cone."""
+        raw = np.array(msg.ranges, dtype=np.float32)
+        n = len(raw)
         
-        # Filter inf and 0
-        valid = [r for r in samples if r > 0.1 and not math.isinf(r)]
-        if valid:
-            self.hazard_front = min(valid) < 0.6
-        else:
-            self.hazard_front = False
+        # FRONT CONE: First and last 10 degrees sector
+        # (Limo LiDAR usually starts at 0 straight ahead or 180 depending on driver)
+        # Assuming standard ROS LaserScan where 0 is ahead
+        sector = max(1, n // 18) # ~20 deg total
+        front_indices = list(range(0, sector)) + list(range(n - sector, n))
+        
+        front_vals = [raw[i] for i in front_indices if np.isfinite(raw[i]) and raw[i] > 0.10]
+
+        self.hazard_front = len(front_vals) > 0 and min(front_vals) < 0.45
 
     def image_cb(self, msg):
-        """HSV Pipeline for object and patch detection."""
+        """HSV Vision Pipeline with noise cleanup."""
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             self.img_w = frame.shape[1]
+
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            
-            # --- Box Detection (Blue) ---
-            mask_box = cv2.inRange(hsv, *self.blue_hsv)
+            kernel = np.ones((5, 5), np.uint8)
+
+            # --- Target detection (Blue Box) ---
+            mask_box = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
+            # Morphology to clean noise
+            mask_box = cv2.morphologyEx(mask_box, cv2.MORPH_OPEN, kernel)
+            mask_box = cv2.morphologyEx(mask_box, cv2.MORPH_CLOSE, kernel)
             M_box = cv2.moments(mask_box)
-            if M_box['m00'] > 1000:
+
+            if M_box["m00"] > 1200:
                 self.box_visible = True
-                self.box_center = int(M_box['m10'] / M_box['m00'])
-                self.box_area = M_box['m00']
+                self.box_center = int(M_box["m10"] / M_box["m00"])
+                self.box_area = M_box["m00"]
             else:
                 self.box_visible = False
-            
-            # --- Patch Detection (Red) ---
-            mask_patch = cv2.inRange(hsv, *self.red_hsv)
+                self.box_area = 0
+
+            # --- Goal detection (Red Patch) ---
+            mask_patch1 = cv2.inRange(hsv, self.red1_lower, self.red1_upper)
+            mask_patch2 = cv2.inRange(hsv, self.red2_lower, self.red2_upper)
+            mask_patch = mask_patch1 | mask_patch2 # Combine both red ranges
+            mask_patch = cv2.morphologyEx(mask_patch, cv2.MORPH_OPEN, kernel)
+            mask_patch = cv2.morphologyEx(mask_patch, cv2.MORPH_CLOSE, kernel)
             M_patch = cv2.moments(mask_patch)
-            if M_patch['m00'] > 500:
+
+            if M_patch["m00"] > 2000:
                 self.patch_visible = True
-                self.patch_center = int(M_patch['m10'] / M_patch['m00'])
+                self.patch_center = int(M_patch["m10"] / M_patch["m00"])
             else:
                 self.patch_visible = False
-                
+
         except Exception as e:
             self.get_logger().error(f"Vision failure: {e}")
 
     def odom_cb(self, msg):
-        """Tracks global pose for 'Return to Home' behavior."""
+        """Pose tracking for origin reset."""
         self.pose["x"] = msg.pose.pose.position.x
         self.pose["y"] = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        # Normalize to Euler Yaw
-        self.pose["theta"] = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z))
+        # Yaw conversion
+        self.pose["theta"] = math.atan2(
+            2 * (q.w * q.z + q.x * q.y),
+            1 - 2 * (q.y * q.y + q.z * q.z)
+        )
 
     def control_tick(self):
-        """State Machine execution at 10Hz."""
+        """High-level behavior state machine."""
         cmd = Twist()
         now = self.get_clock().now()
         dt = (now - self.last_state_time).nanoseconds / 1e9
 
-        # Safety Override
-        if self.hazard_front and self.state not in ["AVOIDING", "PUSHING"]:
+        # --- GLOBAL BEHAVIOR: Obstacle Avoidance (Blocked during target approach/push) ---
+        if self.hazard_front and self.state not in ["AVOIDING", "ALIGNING", "PUSHING"]:
             self.transition("AVOIDING")
 
         if self.state == "EXPLORING":
-            # Rotate and search
-            cmd.angular.z = 0.5
+            # Search rotation
+            cmd.angular.z = self.angular_speed
             if self.box_visible:
                 self.transition("ALIGNING")
 
         elif self.state == "ALIGNING":
-            # Visual Servo toward target
-            err = (self.img_w / 2) - self.box_center
-            cmd.angular.z = err * 0.005
-            cmd.linear.x = 0.15
-            
-            # If target lost, go back to exploring
+            # Visual Servo to target
             if not self.box_visible:
                 self.transition("EXPLORING")
-            
-            # Transition to push when close
-            if self.hazard_front: # Lidar confirms contact/nearness
-                self.transition("PUSHING")
+            else:
+                err = (self.img_w / 2) - self.box_center
+                cmd.angular.z = float(err) * 0.005 # PD controller kP
+                cmd.linear.x = self.linear_speed * 0.5
+
+                # Switch to push on contact or proximity
+                if self.box_area > 18000 or self.hazard_front:
+                    self.transition("PUSHING")
 
         elif self.state == "PUSHING":
-            # Clear object toward goal if visible, else forward
-            cmd.linear.x = 0.4
+            # Execution: Push toward patch if visible
+            cmd.linear.x = self.linear_speed
             if self.patch_visible:
                 err = (self.img_w / 2) - self.patch_center
-                cmd.angular.z = err * 0.002 # Gentle steer towards patch
-            
-            if dt > 5.0: # Push for 5s
+                cmd.angular.z = float(err) * 0.002
+
+            if dt > 4.5: # Push complete
                 self.transition("RECOVERY")
 
         elif self.state == "AVOIDING":
-            # Reactive turn away
-            cmd.angular.z = 0.8
-            cmd.linear.x = -0.1
-            if not self.hazard_front:
+            # Reactive reverse and turn
+            cmd.linear.x = -0.05
+            cmd.angular.z = self.angular_speed * 1.2
+            if not self.hazard_front and dt > 1.0:
                 self.transition("EXPLORING")
 
         elif self.state == "RECOVERY":
-            # Backup and reposition
-            cmd.linear.x = -0.2
-            if dt > 2.0:
+            # Back up after push
+            cmd.linear.x = -0.15
+            if dt > 1.5:
                 self.transition("RETURNING")
 
         elif self.state == "RETURNING":
-            # Global navigation back to center
-            dist = math.sqrt(self.pose["x"]**2 + self.pose["y"]**2)
+            # Navigate back to origin (0,0)
+            dist = math.sqrt(self.pose["x"] ** 2 + self.pose["y"] ** 2)
             goal_theta = math.atan2(-self.pose["y"], -self.pose["x"])
             err_theta = self.normalize_theta(goal_theta - self.pose["theta"])
-            
-            cmd.angular.z = err_theta * 1.5
-            cmd.linear.x = 0.3 if abs(err_theta) < 0.5 else 0.0
-            
+
+            cmd.angular.z = 1.2 * err_theta
+            cmd.linear.x = 0.15 if abs(err_theta) < 0.4 else 0.0
+
             if dist < 0.4:
                 self.transition("EXPLORING")
 
@@ -192,25 +201,29 @@ class TidyBotNode(Node):
 
     def transition(self, new_state):
         if self.state != new_state:
-            self.get_logger().info(f"MISSION_UPDATE: {self.state} -> {new_state}")
+            self.get_logger().info(f"STATE_TRANSITION: {self.state} -> {new_state}")
             self.prev_state = self.state
             self.state = new_state
             self.last_state_time = self.get_clock().now()
 
-    def normalize_theta(self, theta):
-        while theta > math.pi: theta -= 2*math.pi
-        while theta < -math.pi: theta += 2*math.pi
+    @staticmethod
+    def normalize_theta(theta):
+        while theta > math.pi: theta -= 2 * math.pi
+        while theta < -math.pi: theta += 2 * math.pi
         return theta
 
-def main():
-    rclpy.init()
+
+def main(args=None):
+    rclpy.init(args=args)
     node = TidyBotNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

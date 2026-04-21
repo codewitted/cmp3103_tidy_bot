@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>cmp3103_tidy_bot</name>
+  <version>1.0.0</version>
+  <description>CMP3103 Assessment 1: TidyBot Controller for AgileX Limo</description>
+  <maintainer email="codewitted@gmail.com">Kevin Byamukama</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>nav_msgs</depend>
+
+  <test_dependency>ament_copyright</test_dependency>
+  <test_dependency>ament_flake8</test_dependency>
+  <test_dependency>ament_pep257</test_dependency>
+  <test_dependency>python3-pytest</test_dependency>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
